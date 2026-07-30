@@ -13,12 +13,20 @@ from opendbc.car.interfaces import ACCEL_MIN, ACCEL_MAX
 class LongitudinalMpcSP:
   def __init__(self) -> None:
     self._accel_max_trajectory: tuple[float, ...] | None = None
+    self._cruise_accel_max: float | None = None
     self._jerk_cost_multiplier = 1.0
     self.last_solution_status = 0
 
-  def set_accel_controller_params(self, accel_max: tuple[float, ...] | None, jerk_cost_multiplier: float) -> None:
+  def set_accel_controller_params(self, accel_max: tuple[float, ...] | None, jerk_cost_multiplier: float,
+                                  cruise_accel_max: float | None = None) -> None:
     self._accel_max_trajectory = accel_max
+    self._cruise_accel_max = cruise_accel_max
     self._jerk_cost_multiplier = jerk_cost_multiplier
+
+  def cruise_accel_max(self, stock_accel_max: float) -> float:
+    if self._cruise_accel_max is None or not np.isfinite(self._cruise_accel_max):
+      return stock_accel_max
+    return min(max(self._cruise_accel_max, 0.0), stock_accel_max)
 
   def scale_jerk_cost(self, jerk_cost: float) -> float:
     return jerk_cost * self._jerk_cost_multiplier

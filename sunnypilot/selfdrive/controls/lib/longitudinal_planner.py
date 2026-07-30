@@ -48,8 +48,9 @@ class LongitudinalPlannerSP:
 
     return experimental_mode and self.dec.mode() == "blended"
 
-  def _run_mpc(self, sm: messaging.SubMaster, v_cruise: float, prev_accel_constraint: bool, accel_max=None, *, jerk_cost_multiplier: float = 1.0) -> None:
-    self.mpc.set_accel_controller_params(accel_max, jerk_cost_multiplier)
+  def _run_mpc(self, sm: messaging.SubMaster, v_cruise: float, prev_accel_constraint: bool, accel_max=None, *,
+               cruise_accel_max=None, jerk_cost_multiplier: float = 1.0) -> None:
+    self.mpc.set_accel_controller_params(accel_max, jerk_cost_multiplier, cruise_accel_max)
     self.mpc.set_weights(prev_accel_constraint, personality=sm['selfdriveState'].personality)
     self.mpc.set_cur_state(self.v_desired_filter.x, self.a_desired)
     self.mpc.update(sm['radarState'], v_cruise, personality=sm['selfdriveState'].personality)
@@ -74,10 +75,12 @@ class LongitudinalPlannerSP:
     valid_lead_stop_hold = actuating and controller.state == AccelControllerState.stopHold and controller.selected_lead >= 0
     controller_v_cruise = v_cruise if valid_lead_stop_hold else min(v_cruise, controller.output_v_target) if actuating else v_cruise
     accel_max = controller.mpc_accel_max if actuating else None
+    cruise_accel_max = controller.cruise_accel_max if actuating else None
     jerk_cost_multiplier = controller.get_jerk_cost_multiplier(
       actuating, prev_accel_constraint, v_cruise - controller_v_cruise, previous_mpc_failed,
     )
-    self._run_mpc(sm, controller_v_cruise, prev_accel_constraint, accel_max, jerk_cost_multiplier=jerk_cost_multiplier)
+    self._run_mpc(sm, controller_v_cruise, prev_accel_constraint, accel_max, cruise_accel_max=cruise_accel_max,
+                  jerk_cost_multiplier=jerk_cost_multiplier)
     return is_e2e
 
   def update_should_stop(self, should_stop: bool) -> bool:

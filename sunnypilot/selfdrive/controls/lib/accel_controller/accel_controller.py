@@ -46,6 +46,7 @@ class AccelController:
     self.is_active = self.launching = self.departure_launching = False
     self.output_v_target = 0.0
     self.mpc_accel_max: tuple[float, ...] | None = None
+    self.cruise_accel_max: float | None = None
     self.state = AccelControllerState.inactive
     self.selected_lead = -1
     self.selected_lead_track_id = -1
@@ -261,6 +262,7 @@ class AccelController:
     self.is_active = self.launching = self.departure_launching = False
     self.output_v_target = 0.0
     self.mpc_accel_max = None
+    self.cruise_accel_max = None
     self.state = AccelControllerState.inactive
     self.selected_lead = -1
     self.selected_lead_track_id = -1
@@ -337,6 +339,9 @@ class AccelController:
     self.departure_launching = self.launching and state.departure_launch
     self.output_v_target = output_target
     self.mpc_accel_max = mpc_accel_max
+    limit_cruise_accel = (active and state.state == AccelControllerState.free and lead_plan.lead_status and lead_plan.closing_speed > 0.0
+                          and planner_accel >= 0.0 and previous_mpc_source == LongitudinalPlanSource.cruise)
+    self.cruise_accel_max = positive_accel_max if limit_cruise_accel else None
     self.state = state.state
     self.selected_lead = lead_plan.selected_lead
     self.selected_lead_track_id = lead_plan.selected_lead_track_id

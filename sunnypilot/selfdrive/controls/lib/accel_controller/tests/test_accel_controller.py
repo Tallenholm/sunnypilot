@@ -57,7 +57,8 @@ def update(controller, radar_state=None, **overrides):
   controller.update(radar_state or make_radar(), **args)
   return SimpleNamespace(
     target_speed=controller.output_v_target, active=controller.is_active, launching=controller.launching,
-    departure_launching=controller.departure_launching, mpc_accel_max=controller.mpc_accel_max, state=controller.state,
+    departure_launching=controller.departure_launching, mpc_accel_max=controller.mpc_accel_max,
+    cruise_accel_max=controller.cruise_accel_max, state=controller.state,
     selected_lead=controller.selected_lead, required_decel=controller.required_decel,
   )
 
@@ -217,6 +218,16 @@ class TestMpcCeiling:
     bypassed = update(controller, radar, planner_accel=-0.2, acc_selected=False)
     assert not bypassed.active and bypassed.mpc_accel_max is None
     assert not controller.target_state.lead_braking
+
+  def test_eco_cruise_limit_remains_active_while_closing_on_a_lead(self):
+    controller = make_controller()
+    radar = make_radar(make_lead(status=True, d_rel=80.0, v_lead_k=19.25))
+    result = update(controller, radar, base_speed=20.0, v_ego=20.0, profile=AccelProfile.eco, planner_accel=0.16,
+                    previous_mpc_source=LongitudinalPlanSource.cruise)
+
+    assert result.state == AccelControllerState.free
+    assert result.mpc_accel_max is None
+    assert result.cruise_accel_max == pytest.approx(AccelController.get_profile_accel_max(AccelProfile.eco, 20.0))
 
   def test_profile_ceiling_stays_continuous_while_a_lead_begins_pulling_away(self):
     controller = make_controller()

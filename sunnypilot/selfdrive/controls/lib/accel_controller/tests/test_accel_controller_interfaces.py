@@ -36,13 +36,15 @@ class PlannerSM(dict):
 
 
 class ControllerStub:
-  def __init__(self, *, target_speed=15.0, active=True, mpc_accel_max=None, state=AccelControllerState.free, selected_lead=-1,
+  def __init__(self, *, target_speed=15.0, active=True, mpc_accel_max=None, cruise_accel_max=None,
+               state=AccelControllerState.free, selected_lead=-1,
                selected_lead_track_id=-1, launching=False, departure_launching=False, required_decel=0.0):
     self.available = self.enabled = True
     self.profile = AccelProfile.normal
     self.output_v_target = target_speed
     self.is_active = active
     self.mpc_accel_max = mpc_accel_max
+    self.cruise_accel_max = cruise_accel_max
     self.state = state
     self.selected_lead = selected_lead
     self.selected_lead_track_id = selected_lead_track_id
@@ -101,7 +103,7 @@ def planner_for_mpc_test(*, target_speed=15.0, active=True, is_e2e=False, mpc_ac
 
 def run_controller_mpc(planner, *, mpc_v_cruise=20.0, force_decel=False):
   calls = []
-  planner._run_mpc = lambda _sm, *args, **kwargs: calls.append((({}, *args), kwargs))
+  planner._run_mpc = lambda _sm, *args, cruise_accel_max=None, **kwargs: calls.append((({}, *args), kwargs))
   sm = {
     "radarState": radar_state(),
     "controlsState": SimpleNamespace(forceDecel=force_decel),
@@ -162,6 +164,10 @@ def test_mpc_inherits_accel_controller_extension_without_changing_stock_signatur
   mpc.update(radar, 30.0)
   np.testing.assert_array_equal(mpc.params[:, 0], ACCEL_MIN)
   np.testing.assert_array_equal(mpc.params[:, 1], ACCEL_MAX)
+  assert mpc.cruise_accel_max(1.6) == 1.6
+
+  mpc.set_accel_controller_params(None, 1.0, 0.4)
+  assert mpc.cruise_accel_max(1.6) == 0.4
 
   requested_ceiling = tuple(np.full(N + 1, 0.4))
   mpc.set_accel_controller_params(requested_ceiling, 1.0)
@@ -218,7 +224,8 @@ def test_inherited_planner_uses_real_state_raw_radar_and_one_mpc_solve():
     calls.append(("update", radar_arg, target, personality))
 
   planner.mpc = SimpleNamespace(
-    set_accel_controller_params=lambda accel_max, multiplier: calls.append(("configure", accel_max, multiplier)),
+    set_accel_controller_params=lambda accel_max, multiplier, cruise_accel_max: calls.append(
+      ("configure", accel_max, multiplier, cruise_accel_max)),
     set_weights=lambda constraint, personality: calls.append(("weights", constraint, personality)),
     set_cur_state=lambda speed, accel: calls.append(("state", speed, accel)),
     update=update_mpc,
@@ -228,7 +235,7 @@ def test_inherited_planner_uses_real_state_raw_radar_and_one_mpc_solve():
   planner._run_mpc(sm, 17.5, True, ceiling, jerk_cost_multiplier=1.2)
 
   assert calls == [
-    ("configure", ceiling, 1.2),
+    ("configure", ceiling, 1.2, None),
     ("weights", True, 2),
     ("state", 12.0, -0.2),
     ("update", radar, 17.5, 2),
