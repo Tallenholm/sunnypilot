@@ -41,6 +41,7 @@ class AccelController:
     self._required_decel_lead = -1
     self._required_decel_lead_track_id = -1
     self._lead_trend_warmup = False
+    self._cruise_accel_limited = False
     self.target_state = TargetState()
     self._held_lead_plan: LeadPlan | None = None
     self.is_active = self.launching = self.departure_launching = False
@@ -82,10 +83,15 @@ class AccelController:
       and lead_plan.selected_lead_track_id != state.selected_lead_track_id
       and (state.selected_lead_track_id >= 0 or lead_plan.selected_lead_track_id >= 0))
     false_relief = has_lead and math.isfinite(filtered_cap) and lead_plan.cap >= filtered_cap + SPEED_RELIEF_DEADBAND
-    if (slot_changed or track_changed) and false_relief and state.lead_switch_guard_frames == 0 and planner_accel <= PLANNER_BRAKING_ACCEL_THRESHOLD:
+    guarded_restriction = state.state in (AccelControllerState.restrict, AccelControllerState.hold, AccelControllerState.release)
+    switched_to_relief = ((slot_changed or track_changed) and false_relief
+                          and (guarded_restriction or planner_accel <= PLANNER_BRAKING_ACCEL_THRESHOLD))
+    confirmed_relief = (not has_lead or (state.target_speed is not None and lead_plan.closing_speed <= 0.0
+                        and lead_plan.cap >= state.target_speed + SPEED_RELIEF_DEADBAND))
+    if switched_to_relief and state.lead_switch_guard_frames == 0:
       state.lead_switch_guard_frames = self.lead_loss_hold_frames
     elif state.lead_switch_guard_frames > 0:
-      state.lead_switch_guard_frames -= 1
+      state.lead_switch_guard_frames = (state.lead_switch_guard_frames - 1 if confirmed_relief else self.lead_loss_hold_frames)
     if slot_changed or track_changed:
       state.matched_lead = False
       state.matched_accel_limit = None
@@ -242,7 +248,8 @@ class AccelController:
     if relief and (ceiling >= state.target_speed + SPEED_RELIEF_DEADBAND or (confirmed_clear_road and ceiling > state.target_speed)):
       if state.lead_switch_guard_frames == 0:
         state.target_speed = ceiling
-      state.state = AccelControllerState.free if state.target_speed >= base_speed - SPEED_RESTRICT_DEADBAND else AccelControllerState.release
+      state.state = (AccelControllerState.hold if state.lead_switch_guard_frames > 0 else
+                     AccelControllerState.free if state.target_speed >= base_speed - SPEED_RESTRICT_DEADBAND else AccelControllerState.release)
     else:
       state.state = AccelControllerState.free if state.target_speed >= base_speed - SPEED_RESTRICT_DEADBAND else AccelControllerState.hold
     return state.target_speed
@@ -259,6 +266,7 @@ class AccelController:
     self._required_decel_samples.clear()
     self._required_decel_lead = self._required_decel_lead_track_id = -1
     self._lead_trend_warmup = False
+    self._cruise_accel_limited = False
     self.is_active = self.launching = self.departure_launching = False
     self.output_v_target = 0.0
     self.mpc_accel_max = None
@@ -322,16 +330,21 @@ class AccelController:
     mpc_accel_max = build_accel_ceiling(effective_accel_max, planner_accel) if matched_limit_active or profile_limit_active else None
     guarded_lead_loss = not lead_plan.lead_status and state.selected_lead >= 0 and state.lead_loss_frames < self.lead_loss_hold_frames
     lead_context = lead_plan.lead_status or math.isfinite(state.filtered_cap) or guarded_lead_loss
-    reserve_eligible = (active and lead_context and not stop_hold_active and state.lead_switch_guard_frames == 0 and not state.launching
-      and not state.e2e_braking_handoff)
+    reserve_eligible = active and lead_context and not stop_hold_active and not state.launching and not state.e2e_braking_handoff
+    reserve_can_arm = reserve_eligible and state.lead_switch_guard_frames == 0
     if not lead_context:
-      state.speed_reserve_armed = False
-    elif (reserve_eligible and not state.speed_reserve_armed and math.isfinite(state.filtered_cap)
-      and state.filtered_cap <= target_speed + TARGET_SPEED_ARM_MARGIN):
-      state.speed_reserve_armed = True
+      state.speed_reserve_armed = state.speed_reserve_suppressed = False
+    else:
+      if state.lead_switch_guard_frames > 0 and planner_accel <= PLANNER_BRAKING_ACCEL_THRESHOLD:
+        state.speed_reserve_suppressed = True
+      elif state.lead_switch_guard_frames == 0 and state.state != AccelControllerState.restrict:
+        state.speed_reserve_suppressed = False
+      if (reserve_can_arm and not state.speed_reserve_armed and math.isfinite(state.filtered_cap)
+        and state.filtered_cap <= target_speed + TARGET_SPEED_ARM_MARGIN):
+        state.speed_reserve_armed = True
 
     output_target = 0.0 if stop_hold_active else target_speed
-    if reserve_eligible and state.speed_reserve_armed:
+    if reserve_eligible and state.speed_reserve_armed and not state.speed_reserve_suppressed:
       output_target = max(0.0, output_target - TARGET_SPEED_RESERVE)
 
     self.is_active = active
@@ -339,9 +352,13 @@ class AccelController:
     self.departure_launching = self.launching and state.departure_launch
     self.output_v_target = output_target
     self.mpc_accel_max = mpc_accel_max
-    limit_cruise_accel = (active and state.state == AccelControllerState.free and lead_plan.lead_status and lead_plan.closing_speed > 0.0
-                          and planner_accel >= 0.0 and previous_mpc_source == LongitudinalPlanSource.cruise)
-    self.cruise_accel_max = positive_accel_max if limit_cruise_accel else None
+    start_cruise_accel_limit = (active and state.state == AccelControllerState.free and lead_plan.lead_status
+                                and lead_plan.closing_speed > 0.0 and planner_accel >= 0.0
+                                and previous_mpc_source == LongitudinalPlanSource.cruise)
+    keep_cruise_accel_limit = (self._cruise_accel_limited and active and lead_context and state.state == AccelControllerState.free
+                               and not state.e2e_braking_handoff)
+    self._cruise_accel_limited = start_cruise_accel_limit or keep_cruise_accel_limit
+    self.cruise_accel_max = positive_accel_max if self._cruise_accel_limited else None
     self.state = state.state
     self.selected_lead = lead_plan.selected_lead
     self.selected_lead_track_id = lead_plan.selected_lead_track_id

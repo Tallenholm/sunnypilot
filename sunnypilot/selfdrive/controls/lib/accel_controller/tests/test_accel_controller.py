@@ -229,6 +229,23 @@ class TestMpcCeiling:
     assert result.mpc_accel_max is None
     assert result.cruise_accel_max == pytest.approx(AccelController.get_profile_accel_max(AccelProfile.eco, 20.0))
 
+  def test_lead_cruise_limit_does_not_follow_mpc_source_or_accel_sign(self):
+    controller = make_controller()
+    expected = AccelController.get_profile_accel_max(AccelProfile.eco, 20.0)
+    inputs = (
+      (LongitudinalPlanSource.cruise, 0.02, 19.9, 100),
+      (LongitudinalPlanSource.lead0, -0.02, 20.1, -1),
+      (LongitudinalPlanSource.cruise, -0.10, 19.9, 101),
+      (LongitudinalPlanSource.lead0, -0.12, 20.1, -1),
+      (LongitudinalPlanSource.lead1, 0.02, 20.1, -1),
+    )
+
+    for source, planner_accel, lead_speed, track_id in inputs:
+      radar = make_radar(make_lead(status=True, d_rel=150.0, v_lead_k=lead_speed, radar_track_id=track_id))
+      result = update(controller, radar, base_speed=20.0, v_ego=20.0, profile=AccelProfile.eco,
+                      planner_accel=planner_accel, previous_mpc_source=source)
+      assert result.cruise_accel_max == pytest.approx(expected)
+
   def test_profile_ceiling_stays_continuous_while_a_lead_begins_pulling_away(self):
     controller = make_controller()
     for _ in range(CAP_FILTER_FRAMES + 5):
@@ -428,6 +445,30 @@ class TestTargetLifecycle:
     assert effective_accel_max(switched) <= AccelController.get_profile_accel_max(AccelProfile.normal, 8.0) + 1e-9
     assert switched.target_speed < 25.0
     assert controller.target_state.lead_switch_guard_frames == controller.lead_loss_hold_frames
+
+  def test_false_relief_track_replacement_requires_stable_relief(self):
+    controller = make_controller()
+    original = make_radar(make_lead(status=True, d_rel=20.0, v_lead_k=8.0, radar_track_id=100))
+    for _ in range(CAP_FILTER_FRAMES + 10):
+      before = update(controller, original, base_speed=25.0, v_ego=10.0, planner_speed=10.0, planner_accel=0.2)
+    assert before.state in (AccelControllerState.restrict, AccelControllerState.hold)
+    assert controller.target_state.speed_reserve_armed
+
+    replacement = make_radar(make_lead(status=True, d_rel=90.0, v_lead_k=12.0, radar_track_id=-1))
+    switched = update(controller, replacement, base_speed=25.0, v_ego=10.0, planner_speed=10.0, planner_accel=0.2)
+
+    assert switched.target_speed <= before.target_speed + 1e-9
+    assert controller.target_state.lead_switch_guard_frames == controller.lead_loss_hold_frames
+
+    for frame in range(controller.lead_loss_hold_frames * 2):
+      radar = original if frame % 2 == 0 else replacement
+      churn = update(controller, radar, base_speed=25.0, v_ego=10.0, planner_speed=10.0, planner_accel=0.2)
+      assert churn.target_speed <= before.target_speed + 1e-9
+
+    for _ in range(controller.lead_loss_hold_frames + 1):
+      released = update(controller, replacement, base_speed=25.0, v_ego=10.0, planner_speed=10.0, planner_accel=0.2)
+    assert controller.target_state.lead_switch_guard_frames == 0
+    assert released.target_speed > before.target_speed
 
   def test_track_id_churn_without_false_relief_does_not_arm_guard(self):
     controller = make_controller()

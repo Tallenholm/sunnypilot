@@ -1029,6 +1029,54 @@ def test_false_range_relief_matches_clean_controller_response():
   _assert_no_new_solver_failures(trace, baseline)
 
 
+def test_route_52f_radar_vision_switch_does_not_release_restricted_pace():
+  glitch_start = 20.0
+  glitch_end = 24.0
+
+  def lead_speed(current_time: float) -> float:
+    return 25.0 if current_time < glitch_end else min(33.0, 25.0 + 2.0 * (current_time - glitch_end))
+
+  def observe(current_time: float, lead_name: str, truth: LeadObservation) -> LeadObservation | None:
+    if lead_name == "leadTwo":
+      return None
+    if not glitch_start <= current_time < glitch_end:
+      return truth | {"radar": True, "radarTrackId": 1119}
+
+    phase = int((current_time - glitch_start) / 0.20)
+    if phase % 2 == 0:
+      return truth | {"vLeadK": truth["vLeadK"] - 0.3, "vRel": truth["vRel"] - 0.3,
+                      "radar": True, "radarTrackId": 1119 if phase % 4 == 0 else 1176}
+    distance_offset = (15.0, 30.0, 60.0)[phase % 3]
+    return truth | {"dRel": truth["dRel"] + distance_offset, "vLead": truth["vLead"] + 1.0,
+                    "vLeadK": truth["vLeadK"] + 1.0, "vRel": truth["vRel"] + 1.0,
+                    "radar": False, "radarTrackId": -1}
+
+  common = dict(
+    duration=28.0, controller_enabled=True, profile=AccelProfile.eco, lead_relevancy=True, speed=28.0,
+    distance_lead=40.0, v_lead=lead_speed, v_cruise=34.72, actuator_delay=0.15, actuator_lag=0.25,
+  )
+  baseline = _run(**common)
+  trace = _run(lead_observation_fn=observe, **common)
+  before = trace.target_speed[np.flatnonzero(trace.time < glitch_start)[-1]]
+  glitch = (trace.time >= glitch_start) & (trace.time < glitch_end)
+  response = (trace.time >= glitch_start - 0.5) & (trace.time <= glitch_end + 1.0)
+  recovered = (trace.time >= glitch_end + 0.8) & (trace.time <= glitch_end + 2.0)
+  gap = trace.distance_lead - trace.distance
+  baseline_gap = baseline.distance_lead - baseline.distance
+  glitch_sources = {trace.source[index] for index in np.flatnonzero(glitch)}
+
+  assert {LongitudinalPlanSource.cruise, LongitudinalPlanSource.lead0} <= glitch_sources
+  assert np.max(trace.target_speed[glitch]) <= before + 0.05
+  assert np.max(trace.target_speed[recovered]) > before + 0.1
+  assert not _has_propulsion_brake_cycle(trace.a_target[response])
+  assert np.max(np.abs(_command_jerk(trace)[response[1:]])) < 3.0
+  assert np.min(gap[response]) >= np.min(baseline_gap[response]) - DROPOUT_GAP_TOLERANCE
+  assert trace.raw_radar_passthrough.all()
+  assert np.all(trace.mpc_calls == 1)
+  assert not trace.fcw.any()
+  _assert_no_new_solver_failures(trace, baseline)
+
+
 @pytest.mark.parametrize("profile", range(3), ids=("eco", "normal", "sport"))
 @pytest.mark.parametrize(("actuator_delay", "actuator_lag"), ACTUATOR_DYNAMICS, ids=ACTUATOR_IDS)
 def test_route_507_braking_lead_slot_switch_has_no_false_relief_cycle(profile, actuator_delay, actuator_lag):
