@@ -13,11 +13,12 @@ from openpilot.selfdrive.controls.lib.longitudinal_mpc_lib.long_mpc import (
 from openpilot.sunnypilot.selfdrive.controls.lib.accel_controller.accel_controller import AccelController, AccelControllerState
 from openpilot.sunnypilot.selfdrive.controls.lib.accel_controller.constants import (
   ACCEL_LIMIT_HORIZON_JERK, ACCEL_PROFILE_MAX_BP, ACCEL_PROFILE_MAX_V, ACCEL_PROFILES, CAP_FILTER_FRAMES, LAUNCH_END_SPEED,
-  COMFORT_DECEL, LAUNCH_TARGET_HEADROOM, LAUNCH_TARGET_SLEW, LEAD_MATCH_ACCEL_SLEW, MATCHED_SPEED_DECEL_RATE,
-  MPC_DECEL_JERK_COST_MULTIPLIER, TARGET_SPEED_RESERVE, RADAR_STALE_TIMEOUT, STOP_GAP_RESERVE, STOP_HOLD_EXIT_FRAMES, AccelProfile,
+  COMFORT_DECEL, LAUNCH_TARGET_HEADROOM, LAUNCH_TARGET_SLEW, LEAD_MATCH_ACCEL_SLEW, LEAD_SWITCH_MAX_HOLD_TIME, MATCHED_SPEED_DECEL_RATE,
+  MPC_DECEL_JERK_COST_MULTIPLIER, RADAR_STALE_TIMEOUT, STOP_GAP_RESERVE, STOP_HOLD_EXIT_FRAMES, TARGET_RELEASE_SLEW,
+  TARGET_SPEED_RESERVE, AccelProfile,
 )
 from openpilot.sunnypilot.selfdrive.controls.lib.accel_controller.helpers import build_accel_ceiling
-from openpilot.sunnypilot.selfdrive.controls.lib.accel_controller.lead import _project_ego, calculate_lead_plan
+from openpilot.sunnypilot.selfdrive.controls.lib.accel_controller.lead import LeadPlan, _project_ego, calculate_lead_plan
 
 
 def make_lead(*, status=False, d_rel=0.0, v_lead_k=0.0, a_lead_k=0.0, a_lead_tau=1.5, radar_track_id=-1):
@@ -84,6 +85,8 @@ class TestProfiles:
       AccelProfile.normal: [1.80, 1.50, 0.97, 0.48, 0.30],
       AccelProfile.sport: [2.00, 1.90, 1.15, 0.68, 0.42],
     }
+    assert TARGET_RELEASE_SLEW == 8.75
+    assert LEAD_SWITCH_MAX_HOLD_TIME == 6.0
 
   @pytest.mark.parametrize("profile", ACCEL_PROFILES)
   def test_lookup_interpolates_and_stays_inside_global_limit(self, profile):
@@ -465,10 +468,130 @@ class TestTargetLifecycle:
       churn = update(controller, radar, base_speed=25.0, v_ego=10.0, planner_speed=10.0, planner_accel=0.2)
       assert churn.target_speed <= before.target_speed + 1e-9
 
-    for _ in range(controller.lead_loss_hold_frames + 1):
-      released = update(controller, replacement, base_speed=25.0, v_ego=10.0, planner_speed=10.0, planner_accel=0.2)
+    released = [update(controller, replacement, base_speed=25.0, v_ego=10.0, planner_speed=10.0, planner_accel=0.2)
+                for _ in range(controller.lead_loss_hold_frames + 1)]
     assert controller.target_state.lead_switch_guard_frames == 0
-    assert released.target_speed > before.target_speed
+    assert released[-1].target_speed > before.target_speed
+    assert np.max(np.diff([before.target_speed, *(result.target_speed for result in released)])) <= TARGET_RELEASE_SLEW * DT_MDL + 1e-9
+
+  def test_initial_lead_target_release_is_slewed(self):
+    controller = make_controller()
+    closing = make_radar(make_lead(status=True, d_rel=90.0, v_lead_k=8.0, radar_track_id=100))
+    relief = make_radar(make_lead(status=True, d_rel=90.0, v_lead_k=12.0, radar_track_id=100))
+    first = update(controller, closing)
+    results = [update(controller, relief) for _ in range(CAP_FILTER_FRAMES)]
+    targets = [first.target_speed, *(result.target_speed for result in results)]
+
+    assert np.max(np.diff(targets)) > 0.0
+    assert np.max(np.diff(targets)) <= TARGET_RELEASE_SLEW * DT_MDL + 1e-9
+    assert controller.target_state.target_speed < controller.target_state.filtered_cap
+    assert controller.target_state.release_slew_armed
+
+  def test_direct_relief_slews_to_a_moving_ceiling(self):
+    controller = make_controller()
+    state = controller.target_state
+    state.target_speed, state.state, state.release_slew_armed = 18.0, AccelControllerState.hold, True
+    state.active_frames, state.selected_lead, state.selected_lead_track_id = 20, 0, 100
+    state.cap_samples = [20.0] * CAP_FILTER_FRAMES
+    targets = []
+
+    for frame in range(70):
+      cap = min(23.0, 20.0 + 0.1 * frame)
+      lead_plan = LeadPlan(cap=cap, selected_lead=0, selected_lead_track_id=100, selected_lead_speed=20.0, lead_status=True)
+      targets.append(controller._update_target(lead_plan, 25.0, 20.0, AccelProfile.normal, 0.48, False,
+                                               LongitudinalPlanSource.cruise, 20.0, 0.0))
+
+    steps = np.diff(targets)
+    assert np.all(steps >= -1e-9)
+    assert np.max(steps) <= TARGET_RELEASE_SLEW * DT_MDL + 1e-9
+    assert targets[-1] == 23.0
+    assert state.state == AccelControllerState.hold and not state.release_slew_armed
+
+    for cap in (23.1, 23.2) * CAP_FILTER_FRAMES:
+      lead_plan = LeadPlan(cap=cap, selected_lead=0, selected_lead_track_id=100, selected_lead_speed=20.0, lead_status=True)
+      controller._update_target(lead_plan, 25.0, 20.0, AccelProfile.normal, 0.48, False,
+                                LongitudinalPlanSource.cruise, 20.0, 0.0)
+    assert state.target_speed == 23.0
+
+  def test_settled_release_does_not_follow_subdeadband_cap_churn(self):
+    controller = make_controller()
+    state = controller.target_state
+    state.target_speed, state.state = 20.0, AccelControllerState.hold
+    state.active_frames, state.selected_lead, state.selected_lead_track_id = 20, 0, 100
+    state.arm_release_slew()
+    targets = [state.target_speed]
+
+    for cap in (19.8, 20.2) * (2 * CAP_FILTER_FRAMES):
+      state.cap_samples = [cap] * CAP_FILTER_FRAMES
+      lead_plan = LeadPlan(cap=cap, selected_lead=0, selected_lead_track_id=100, selected_lead_speed=25.0, lead_status=True)
+      targets.append(controller._update_target(lead_plan, 25.0, 20.0, AccelProfile.normal, 0.48, False,
+                                               LongitudinalPlanSource.cruise, 20.0, 0.0))
+
+    assert np.max(np.diff(targets)) <= TARGET_RELEASE_SLEW * DT_MDL + 1e-9
+    assert state.release_slew_armed and state.release_settle_frames == 1
+
+    settle_updates = math.ceil((state.target_speed - 19.8) / (COMFORT_DECEL[AccelProfile.normal] * DT_MDL)) + CAP_FILTER_FRAMES
+    for _ in range(settle_updates):
+      state.cap_samples = [19.8] * CAP_FILTER_FRAMES
+      lead_plan = LeadPlan(cap=19.8, selected_lead=0, selected_lead_track_id=100, selected_lead_speed=25.0, lead_status=True)
+      controller._update_target(lead_plan, 25.0, 20.0, AccelProfile.normal, 0.48, False,
+                                LongitudinalPlanSource.cruise, 20.0, 0.0)
+    assert not state.release_slew_armed
+
+  def test_guard_timeout_uses_wall_clock_and_does_not_rearm_during_churn(self):
+    controller = make_controller()
+    state = controller.target_state
+    state.target_speed, state.state, state.release_slew_armed = 18.0, AccelControllerState.hold, True
+    state.active_frames, state.selected_lead, state.selected_lead_track_id = 20, 0, 100
+    guard_history = []
+
+    for frame in range(2 * controller.lead_switch_max_hold_frames):
+      state.cap_samples = [20.0] * CAP_FILTER_FRAMES
+      track_id = 200 if frame % 2 == 0 else 100
+      lead_plan = LeadPlan(cap=25.0, selected_lead=0, selected_lead_track_id=track_id, selected_lead_speed=15.0,
+                           closing_speed=1.0, lead_status=True)
+      controller._update_target(lead_plan, 25.0, 20.0, AccelProfile.normal, 0.48, False,
+                                LongitudinalPlanSource.cruise, 18.0, -0.2)
+      guard_history.append(state.lead_switch_guard_frames)
+
+    first_zero = next(index for index, guard in enumerate(guard_history[1:], 1) if guard == 0)
+    assert first_zero <= controller.lead_switch_max_hold_frames
+    assert all(guard == 0 for guard in guard_history[first_zero:])
+    assert state.lead_switch_elapsed_frames == controller.lead_switch_max_hold_frames
+
+    stable = LeadPlan(cap=25.0, selected_lead=0, selected_lead_track_id=100, selected_lead_speed=25.0, lead_status=True)
+    for _ in range(controller.lead_loss_hold_frames + 20):
+      controller._update_target(stable, 25.0, 20.0, AccelProfile.normal, 0.48, False,
+                                LongitudinalPlanSource.cruise, 20.0, 0.0)
+    assert state.target_speed == 25.0 and state.state == AccelControllerState.free
+    assert state.lead_switch_elapsed_frames == 0
+
+    state.cap_samples = [15.0] * CAP_FILTER_FRAMES
+    restrictive = LeadPlan(cap=15.0, selected_lead=0, selected_lead_track_id=100, selected_lead_speed=15.0,
+                           closing_speed=5.0, lead_status=True)
+    controller._update_target(restrictive, 25.0, 20.0, AccelProfile.normal, 0.48, False,
+                              LongitudinalPlanSource.cruise, 20.0, -0.2)
+    replacement = restrictive._replace(cap=25.0, selected_lead_track_id=200, closing_speed=0.0)
+    controller._update_target(replacement, 25.0, 20.0, AccelProfile.normal, 0.48, False,
+                              LongitudinalPlanSource.cruise, 20.0, -0.2)
+    assert state.lead_switch_guard_frames == controller.lead_loss_hold_frames
+
+  def test_guard_timeout_does_not_release_while_planner_is_braking(self):
+    controller = make_controller()
+    state = controller.target_state
+    state.target_speed, state.state, state.release_slew_armed = 18.0, AccelControllerState.hold, True
+    state.active_frames, state.selected_lead, state.selected_lead_track_id = 20, 0, 100
+    targets = []
+
+    for frame in range(controller.lead_switch_max_hold_frames + controller.lead_loss_hold_frames):
+      state.cap_samples = [20.0] * CAP_FILTER_FRAMES
+      lead_plan = LeadPlan(cap=25.0, selected_lead=0, selected_lead_track_id=200 if frame % 2 == 0 else 100,
+                           selected_lead_speed=20.0, closing_speed=0.0, lead_status=True)
+      targets.append(controller._update_target(lead_plan, 25.0, 20.0, AccelProfile.normal, 0.48, False,
+                                               LongitudinalPlanSource.cruise, 18.0, -0.2))
+
+    assert state.lead_switch_guard_frames == 0
+    assert max(targets) == 18.0
 
   def test_track_id_churn_without_false_relief_does_not_arm_guard(self):
     controller = make_controller()
@@ -481,7 +604,7 @@ class TestTargetLifecycle:
 
     assert controller.target_state.lead_switch_guard_frames == 0
 
-  def test_short_dropout_holds_then_releases_without_a_second_accel_cap(self):
+  def test_short_dropout_holds_then_releases_at_a_bounded_target_rate(self):
     controller = make_controller()
     for _ in range(CAP_FILTER_FRAMES + 20):
       restricted = update(controller, restrictive_radar())
@@ -489,8 +612,11 @@ class TestTargetLifecycle:
     held = [update(controller) for _ in range(controller.lead_loss_hold_frames - 1)]
     assert all(result.target_speed <= restricted.target_speed + 1e-9 for result in held)
 
-    released = update(controller)
-    assert released.target_speed == 25.0
+    released = [update(controller) for _ in range(40)]
+    targets = np.asarray([restricted.target_speed, *(result.target_speed for result in released)])
+    assert np.max(np.diff(targets)) <= TARGET_RELEASE_SLEW * DT_MDL + TARGET_SPEED_RESERVE + 1e-9
+    assert released[-1].target_speed == 25.0
+    assert released[-1].state == AccelControllerState.free
 
   def test_previous_lead_source_synchronizes_down_to_planner(self):
     controller = make_controller()
@@ -905,7 +1031,8 @@ class TestTargetLifecycle:
     assert target_state.target_speed is None and target_state.matched_accel_limit is None
     assert target_state.state == AccelControllerState.inactive
     assert target_state.departure_frames == target_state.active_frames == target_state.lead_loss_frames == target_state.stale_frames == 0
-    assert target_state.lead_switch_guard_frames == 0
+    assert target_state.lead_switch_guard_frames == target_state.lead_switch_elapsed_frames == target_state.lead_switch_stable_frames == 0
+    assert target_state.release_settle_frames == 0 and target_state.release_settle_speed is None and not target_state.release_slew_armed
     assert target_state.selected_lead == target_state.selected_lead_track_id == -1
     assert target_state.cap_samples == [math.inf] * CAP_FILTER_FRAMES
     assert target_state.lead_speed_samples == [math.inf] * CAP_FILTER_FRAMES

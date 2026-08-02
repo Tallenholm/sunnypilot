@@ -5,7 +5,8 @@ import numpy as np
 
 from cereal import custom
 from openpilot.sunnypilot.selfdrive.controls.lib.accel_controller.constants import (
-  CAP_FILTER_FRAMES, DEPARTURE_MOTION_NOISE_FLOOR, DEPARTURE_MOTION_STEP_MIN, STOP_HOLD_CREEP_DISTANCE, STOP_HOLD_CREEP_SPEED, STOP_HOLD_EXIT_FRAMES,
+  CAP_FILTER_FRAMES, DEPARTURE_MOTION_NOISE_FLOOR, DEPARTURE_MOTION_STEP_MIN, SPEED_RELIEF_DEADBAND, STOP_HOLD_CREEP_DISTANCE,
+  STOP_HOLD_CREEP_SPEED, STOP_HOLD_EXIT_FRAMES,
 )
 from openpilot.sunnypilot.selfdrive.controls.lib.accel_controller.lead import LeadPlan
 
@@ -97,13 +98,61 @@ class TargetState:
     self.departure = DepartureTracker()
     self.target_speed: float | None = None
     self.state = AccelControllerState.inactive
-    self.departure_frames = self.active_frames = self.lead_loss_frames = 0
-    self.lead_switch_guard_frames = self.stale_frames = 0
+    self.departure_frames = self.active_frames = self.lead_loss_frames = self.release_settle_frames = 0
+    self.lead_switch_guard_frames = self.lead_switch_elapsed_frames = self.lead_switch_stable_frames = self.stale_frames = 0
     self.selected_lead = self.selected_lead_track_id = -1
-    self.launching = self.departure_launch = self.matched_lead = False
+    self.launching = self.departure_launch = self.matched_lead = self.release_slew_armed = False
     self.lead_braking = self.e2e_braking_handoff = self.speed_reserve_armed = False
     self.speed_reserve_suppressed = False
     self.matched_accel_limit: float | None = None
+    self.release_settle_speed: float | None = None
+
+  def reset_lead_switch_guard(self) -> None:
+    self.lead_switch_guard_frames = self.lead_switch_elapsed_frames = self.lead_switch_stable_frames = 0
+
+  def arm_release_slew(self, force: bool = False) -> None:
+    if self.release_slew_armed:
+      self.release_settle_frames = 0
+      return
+    if not force and self.release_settle_speed is not None and self.target_speed is not None:
+      if self.release_settle_speed - self.target_speed < SPEED_RELIEF_DEADBAND:
+        return
+    self.release_slew_armed = True
+    self.release_settle_frames = 0
+    self.release_settle_speed = None
+
+  def reset_release_slew(self, settled_speed: float | None = None) -> None:
+    self.release_slew_armed = False
+    self.release_settle_frames = 0
+    self.release_settle_speed = settled_speed
+
+  def update_release_slew(self, ceiling: float, settled: bool) -> None:
+    if not self.release_slew_armed:
+      return
+    if not settled:
+      self.release_settle_frames = 0
+    elif self.release_settle_speed is None or ceiling > self.release_settle_speed:
+      self.release_settle_frames = 1
+      self.release_settle_speed = ceiling
+    else:
+      self.release_settle_frames += 1
+    if self.release_settle_frames >= CAP_FILTER_FRAMES:
+      self.release_slew_armed = False
+      self.release_settle_frames = 0
+
+  def update_lead_switch_guard(self, arm: bool, confirmed: bool, unstable: bool, hold_frames: int, max_frames: int) -> None:
+    if self.lead_switch_elapsed_frames > 0:
+      self.lead_switch_stable_frames = 0 if unstable else self.lead_switch_stable_frames + 1
+      if self.lead_switch_guard_frames == 0 and self.lead_switch_stable_frames >= hold_frames:
+        self.reset_lead_switch_guard()
+    if arm and self.lead_switch_elapsed_frames == 0:
+      self.lead_switch_guard_frames, self.lead_switch_elapsed_frames = hold_frames, 1
+    elif self.lead_switch_guard_frames > 0:
+      self.lead_switch_elapsed_frames += 1
+      if self.lead_switch_elapsed_frames >= max_frames:
+        self.lead_switch_guard_frames = 0
+      else:
+        self.lead_switch_guard_frames = self.lead_switch_guard_frames - 1 if confirmed else hold_frames
 
   @property
   def filtered_cap(self) -> float:
@@ -136,5 +185,7 @@ class TargetState:
     self.state = AccelControllerState.stopHold
     self.departure_frames = 0
     self.launching = self.departure_launch = False
+    self.reset_release_slew()
     self.matched_lead = self.speed_reserve_armed = self.speed_reserve_suppressed = False
     self.matched_accel_limit = None
+    self.reset_lead_switch_guard()

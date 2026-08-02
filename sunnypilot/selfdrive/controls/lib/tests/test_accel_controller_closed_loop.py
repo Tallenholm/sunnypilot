@@ -14,8 +14,8 @@ from openpilot.sunnypilot.selfdrive.test.longitudinal_maneuvers.plant import PRI
 from openpilot.sunnypilot.selfdrive.controls.lib.accel_controller import accel_controller as accel_controller_module
 from openpilot.sunnypilot.selfdrive.controls.lib.accel_controller.accel_controller import AccelControllerState
 from openpilot.sunnypilot.selfdrive.controls.lib.accel_controller.constants import (
-  MATCHED_SPEED_DECEL_RATE, MPC_DECEL_JERK_COST_MULTIPLIER, MPC_DECEL_JERK_MAX_REQUIRED_DECEL,
-  MPC_DECEL_JERK_MAX_REQUIRED_DECEL_RATE, MPC_DECEL_TREND_FRAMES, TARGET_SPEED_RESERVE, STOP_HOLD_EXIT_FRAMES, AccelProfile,
+  LEAD_LOSS_HOLD_TIME, MATCHED_SPEED_DECEL_RATE, MPC_DECEL_JERK_COST_MULTIPLIER, MPC_DECEL_JERK_MAX_REQUIRED_DECEL,
+  MPC_DECEL_JERK_MAX_REQUIRED_DECEL_RATE, MPC_DECEL_TREND_FRAMES, TARGET_RELEASE_SLEW, TARGET_SPEED_RESERVE, STOP_HOLD_EXIT_FRAMES, AccelProfile,
 )
 
 ACTUATOR_DYNAMICS = (
@@ -196,8 +196,8 @@ def _run(
   return trace
 
 
-def _first_time_below(trace: ClosedLoopTrace, threshold: float) -> float:
-  indices = np.flatnonzero(trace.a_target <= threshold)
+def _first_time_below(trace: ClosedLoopTrace, threshold: float, after: float = 0.0) -> float:
+  indices = np.flatnonzero((trace.time >= after) & (trace.a_target <= threshold))
   assert len(indices), f"never reached {threshold} m/s²"
   return float(trace.time[indices[0]])
 
@@ -430,10 +430,17 @@ def test_clear_road_launch_is_prompt_and_profiles_separate_above_launch_speed():
   for trace in traces:
     positive = np.flatnonzero(trace.a_target > 0.05)
     moving = np.flatnonzero(trace.speed > 0.01)
+    target_steps = np.diff(trace.target_speed)
+    release = int(np.argmax(target_steps))
     assert len(positive) and trace.time[positive[0]] <= 4 * DT_MDL
     assert len(moving) and trace.time[moving[0]] <= 1.0
     assert np.interp(1.0, trace.time, trace.speed) >= 0.33
+    assert target_steps[release] > TARGET_RELEASE_SLEW * DT_MDL
+    assert trace.time[release + 1] <= 0.5
+    assert abs(_command_jerk(trace)[release]) < 5.0
+    assert abs(np.diff(trace.acceleration)[release] / DT_MDL) < 1.0
     assert not np.any(trace.a_target < -0.05)
+    assert not _has_propulsion_brake_cycle(trace.a_target)
     assert trace.solver_failures == 0
 
   launch_window = traces[0].time <= 0.5
@@ -447,6 +454,36 @@ def test_clear_road_launch_is_prompt_and_profiles_separate_above_launch_speed():
   assert final_speed[1] + 0.75 < final_speed[2]
   ceiling_at_ten = [float(np.interp(10.0, trace.speed, trace.mpc_upper_min)) for trace in traces]
   assert ceiling_at_ten[0] < ceiling_at_ten[1] < ceiling_at_ten[2]
+
+
+@pytest.mark.parametrize(("actuator_delay", "actuator_lag"), ACTUATOR_DYNAMICS, ids=ACTUATOR_IDS)
+def test_high_speed_lead_seed_release_has_no_target_snap(actuator_delay, actuator_lag):
+  dropout_time = 5.0
+
+  def observe(current_time: float, lead_name: str, truth: LeadObservation) -> LeadObservation | None:
+    return None if lead_name == "leadTwo" or current_time >= dropout_time else truth
+
+  common = dict(
+    duration=7.0, profile=AccelProfile.eco, lead_relevancy=True, speed=22.0,
+    distance_lead=100.0, v_lead=20.0, v_cruise=30.0, lead_observation_fn=observe,
+    actuator_delay=actuator_delay, actuator_lag=actuator_lag,
+  )
+  baseline = _run(controller_enabled=False, **common)
+  trace = _run(controller_enabled=True, **common)
+  response = (trace.time >= dropout_time - 0.5) & (trace.time <= dropout_time + 2.0)
+  response_steps = (trace.time[1:] >= dropout_time) & (trace.time[1:] <= dropout_time + 2.0)
+  steps = np.diff(trace.target_speed)
+  release = np.flatnonzero(response_steps & (steps > 1e-6))
+
+  assert len(release) and trace.time[release[0] + 1] <= dropout_time + LEAD_LOSS_HOLD_TIME + DT_MDL + 1e-9
+  assert np.max(steps[response_steps]) <= TARGET_RELEASE_SLEW * DT_MDL + TARGET_SPEED_RESERVE + 1e-9
+  assert trace.target_speed[trace.time >= dropout_time + 2.0][0] == 30.0
+  assert np.max(np.abs(_command_jerk(trace)[response_steps])) <= np.max(np.abs(_command_jerk(baseline)[response_steps])) + 1e-9
+  release_response = response_steps.copy()
+  release_response[:release[0]] = False
+  assert np.max(np.abs(_command_jerk(trace)[release_response])) < 1.0
+  assert not _has_propulsion_brake_cycle(trace.a_target[response])
+  assert not trace.fcw.any() and trace.solver_failures == 0
 
 
 @pytest.mark.parametrize(
@@ -1029,7 +1066,8 @@ def test_false_range_relief_matches_clean_controller_response():
   _assert_no_new_solver_failures(trace, baseline)
 
 
-def test_route_52f_radar_vision_switch_does_not_release_restricted_pace():
+@pytest.mark.parametrize(("actuator_delay", "actuator_lag"), ACTUATOR_DYNAMICS, ids=ACTUATOR_IDS)
+def test_route_52f_radar_vision_switch_does_not_release_restricted_pace(actuator_delay, actuator_lag):
   glitch_start = 20.0
   glitch_end = 24.0
 
@@ -1053,7 +1091,7 @@ def test_route_52f_radar_vision_switch_does_not_release_restricted_pace():
 
   common = dict(
     duration=28.0, controller_enabled=True, profile=AccelProfile.eco, lead_relevancy=True, speed=28.0,
-    distance_lead=40.0, v_lead=lead_speed, v_cruise=34.72, actuator_delay=0.15, actuator_lag=0.25,
+    distance_lead=40.0, v_lead=lead_speed, v_cruise=34.72, actuator_delay=actuator_delay, actuator_lag=actuator_lag,
   )
   baseline = _run(**common)
   trace = _run(lead_observation_fn=observe, **common)
@@ -1068,6 +1106,7 @@ def test_route_52f_radar_vision_switch_does_not_release_restricted_pace():
   assert {LongitudinalPlanSource.cruise, LongitudinalPlanSource.lead0} <= glitch_sources
   assert np.max(trace.target_speed[glitch]) <= before + 0.05
   assert np.max(trace.target_speed[recovered]) > before + 0.1
+  assert np.max(np.diff(trace.target_speed)[response[1:]]) <= TARGET_RELEASE_SLEW * DT_MDL + TARGET_SPEED_RESERVE + 1e-9
   assert not _has_propulsion_brake_cycle(trace.a_target[response])
   assert np.max(np.abs(_command_jerk(trace)[response[1:]])) < 3.0
   assert np.min(gap[response]) >= np.min(baseline_gap[response]) - DROPOUT_GAP_TOLERANCE
@@ -1075,6 +1114,147 @@ def test_route_52f_radar_vision_switch_does_not_release_restricted_pace():
   assert np.all(trace.mpc_calls == 1)
   assert not trace.fcw.any()
   _assert_no_new_solver_failures(trace, baseline)
+
+
+@pytest.mark.parametrize(("actuator_delay", "actuator_lag"), ACTUATOR_DYNAMICS, ids=ACTUATOR_IDS)
+def test_route_533_same_track_relief_has_no_target_snap(actuator_delay, actuator_lag):
+  glitch_start = 20.0
+  glitch_end = 24.0
+
+  def lead_speed(current_time: float) -> float:
+    return 25.0 if current_time < glitch_end else min(33.0, 25.0 + 2.0 * (current_time - glitch_end))
+
+  def observe(current_time: float, lead_name: str, truth: LeadObservation) -> LeadObservation | None:
+    if lead_name == "leadTwo":
+      return None
+    observed = truth | {"radar": True, "radarTrackId": 1119}
+    if not glitch_start <= current_time < glitch_end:
+      return observed
+    phase = int((current_time - glitch_start) / 0.20)
+    if phase % 2 == 0:
+      return observed | {"vLeadK": truth["vLeadK"] - 0.3, "vRel": truth["vRel"] - 0.3}
+    return observed | {"dRel": truth["dRel"] + (8.0, 12.0, 18.0)[phase % 3], "vLead": truth["vLead"] + 0.5,
+                       "vLeadK": truth["vLeadK"] + 0.5, "vRel": truth["vRel"] + 0.5}
+
+  common = dict(
+    duration=28.0, controller_enabled=True, profile=AccelProfile.eco, lead_relevancy=True, speed=28.0,
+    distance_lead=40.0, v_lead=lead_speed, v_cruise=34.72, actuator_delay=actuator_delay, actuator_lag=actuator_lag,
+  )
+  clean = _run(**common)
+  trace = _run(lead_observation_fn=observe, **common)
+  glitch = (trace.time >= glitch_start) & (trace.time < glitch_end)
+  response = (trace.time >= glitch_start - 0.5) & (trace.time <= glitch_end + 1.0)
+  clean_gap = clean.distance_lead - clean.distance
+  gap = trace.distance_lead - trace.distance
+  glitch_sources = {trace.source[index] for index in np.flatnonzero(glitch)}
+
+  assert {LongitudinalPlanSource.cruise, LongitudinalPlanSource.lead0} <= glitch_sources
+  assert np.max(np.diff(trace.target_speed)[response[1:]]) <= TARGET_RELEASE_SLEW * DT_MDL + TARGET_SPEED_RESERVE + 1e-9
+  assert not _has_propulsion_brake_cycle(trace.a_target[response])
+  assert not _has_brake_coast_brake(trace.a_target[response])
+  assert np.max(np.abs(_command_jerk(trace)[response[1:]])) < 3.0
+  assert float(np.percentile(np.abs(_filtered_realized_jerk(trace)), 95)) <= float(np.percentile(np.abs(_filtered_realized_jerk(clean)), 95)) + 0.02
+  assert np.min(gap[response]) >= np.min(clean_gap[response]) - DROPOUT_GAP_TOLERANCE
+  assert trace.raw_radar_passthrough.all()
+  assert np.all(trace.mpc_calls == 1)
+  assert not trace.fcw.any()
+  _assert_no_new_solver_failures(trace, clean)
+
+
+@pytest.mark.parametrize(("actuator_delay", "actuator_lag"), ACTUATOR_DYNAMICS, ids=ACTUATOR_IDS)
+def test_route_532_sustained_switch_churn_has_no_target_snap(actuator_delay, actuator_lag):
+  glitch_start = 20.0
+  glitch_end = 32.0
+
+  def lead_speed(current_time: float) -> float:
+    return 25.0 if current_time < glitch_end else min(33.0, 25.0 + 2.0 * (current_time - glitch_end))
+
+  def observe(current_time: float, lead_name: str, truth: LeadObservation) -> LeadObservation | None:
+    if lead_name == "leadTwo":
+      return None
+    if not glitch_start <= current_time < glitch_end:
+      return truth | {"radar": True, "radarTrackId": 1119}
+    phase = int((current_time - glitch_start) / 0.20)
+    if phase % 2 == 0:
+      return truth | {"vLeadK": truth["vLeadK"] - 0.3, "vRel": truth["vRel"] - 0.3,
+                      "radar": True, "radarTrackId": 1119 if phase % 4 == 0 else 1176}
+    return truth | {"dRel": truth["dRel"] + (15.0, 30.0, 60.0)[phase % 3], "vLead": truth["vLead"] + 1.0,
+                    "vLeadK": truth["vLeadK"] + 1.0, "vRel": truth["vRel"] + 1.0, "radar": False, "radarTrackId": -1}
+
+  common = dict(
+    duration=36.0, profile=AccelProfile.eco, lead_relevancy=True, speed=28.0,
+    distance_lead=40.0, v_lead=lead_speed, v_cruise=34.72, actuator_delay=actuator_delay, actuator_lag=actuator_lag,
+  )
+  baseline = _run(controller_enabled=False, lead_observation_fn=observe, **common)
+  trace = _run(controller_enabled=True, lead_observation_fn=observe, **common)
+  before = trace.target_speed[np.flatnonzero(trace.time < glitch_start)[-1]]
+  protected = (trace.time >= glitch_start) & (trace.time < glitch_start + 4.0)
+  response = (trace.time >= glitch_start - 0.5) & (trace.time <= glitch_end + 1.0)
+  gap = trace.distance_lead - trace.distance
+
+  assert np.max(trace.target_speed[protected]) <= before + 0.05
+  assert np.max(np.diff(trace.target_speed)[response[1:]]) <= TARGET_RELEASE_SLEW * DT_MDL + TARGET_SPEED_RESERVE + 1e-9
+  assert not _has_propulsion_brake_cycle(trace.a_target[response])
+  assert not _has_brake_coast_brake(trace.a_target[response])
+  assert np.max(np.abs(_command_jerk(trace)[response[1:]])) < 3.0
+  assert np.min(gap[response]) > STOP_DISTANCE + 10.0
+  assert trace.raw_radar_passthrough.all()
+  assert np.all(trace.mpc_calls == 1)
+  assert not trace.fcw.any()
+  _assert_no_new_solver_failures(trace, baseline)
+
+
+@pytest.mark.parametrize(("actuator_delay", "actuator_lag"), ACTUATOR_DYNAMICS, ids=ACTUATOR_IDS)
+def test_sustained_switch_churn_timeout_preserves_braking_safety(monkeypatch, actuator_delay, actuator_lag):
+  churn_start = 20.0
+  braking_start = 26.0
+  churn_end = 32.0
+
+  def lead_speed(current_time: float) -> float:
+    progress = np.clip((current_time - braking_start) / 4.0, 0.0, 1.0)
+    return float(25.0 - 3.0 * (3.0 * progress**2 - 2.0 * progress**3))
+
+  def observe(current_time: float, lead_name: str, truth: LeadObservation) -> LeadObservation | None:
+    if lead_name == "leadTwo":
+      return None
+    observed = truth | {"aLeadK": 0.0}
+    if not churn_start <= current_time < churn_end:
+      return observed | {"radar": True, "radarTrackId": 1119}
+    phase = int((current_time - churn_start) / 0.20)
+    if phase % 2 == 0:
+      return observed | {"vLeadK": truth["vLeadK"] - 0.3, "vRel": truth["vRel"] - 0.3,
+                         "radar": True, "radarTrackId": 1119 if phase % 4 == 0 else 1176}
+    return observed | {"dRel": truth["dRel"] + (15.0, 30.0, 60.0)[phase % 3], "vLead": truth["vLead"] + 1.0,
+                       "vLeadK": truth["vLeadK"] + 1.0, "vRel": truth["vRel"] + 1.0, "radar": False, "radarTrackId": -1}
+
+  common = dict(
+    duration=churn_end, controller_enabled=True, profile=AccelProfile.eco, lead_relevancy=True, speed=28.0,
+    distance_lead=50.0, v_lead=lead_speed, v_cruise=34.72, lead_observation_fn=observe,
+    actuator_delay=actuator_delay, actuator_lag=actuator_lag,
+  )
+  with monkeypatch.context() as patch:
+    patch.setattr(accel_controller_module, "LEAD_SWITCH_MAX_HOLD_TIME", common["duration"])
+    guarded = _run(**common)
+  trace = _run(**common)
+  after_timeout = (trace.time[1:] >= churn_start + accel_controller_module.LEAD_SWITCH_MAX_HOLD_TIME) & (trace.time[1:] < churn_end)
+  planner_braking = trace.planner_seed_accel[1:] <= accel_controller_module.PLANNER_BRAKING_ACCEL_THRESHOLD
+  gap = trace.distance_lead - trace.distance
+  guarded_gap = guarded.distance_lead - guarded.distance
+  lead_speeds = np.asarray([lead_speed(current_time) for current_time in trace.time])
+  closing = trace.speed - lead_speeds
+  guarded_closing = guarded.speed - lead_speeds
+  ttc = np.min(gap[closing > 0.1] / closing[closing > 0.1])
+  guarded_ttc = np.min(guarded_gap[guarded_closing > 0.1] / guarded_closing[guarded_closing > 0.1])
+
+  assert np.any(after_timeout & planner_braking)
+  assert np.max(np.diff(trace.target_speed)[after_timeout & planner_braking]) <= 1e-9
+  for threshold in (-0.5, -1.0):
+    timeout = churn_start + accel_controller_module.LEAD_SWITCH_MAX_HOLD_TIME
+    assert _first_time_below(trace, threshold, timeout) <= _first_time_below(guarded, threshold, timeout) + 1e-9
+  assert np.min(gap) >= np.min(guarded_gap) - 0.02
+  assert ttc >= guarded_ttc - 0.02
+  assert not trace.fcw.any()
+  assert trace.solver_failures == guarded.solver_failures == 0
 
 
 @pytest.mark.parametrize("profile", range(3), ids=("eco", "normal", "sport"))

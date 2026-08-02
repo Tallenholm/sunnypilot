@@ -10,9 +10,10 @@ from openpilot.sunnypilot import get_sanitize_int_param
 from openpilot.sunnypilot.selfdrive.controls.lib.accel_controller.constants import (
   CAP_FILTER_FRAMES, COMFORT_DECEL, DEPARTURE_MOTION_NOISE_FLOOR, LAUNCH_END_SPEED, LAUNCH_TARGET_HEADROOM, LAUNCH_TARGET_SLEW,
   LEAD_BRAKING_ACCEL_THRESHOLD, LEAD_LOSS_HOLD_TIME, LEAD_MATCH_ACCEL_SLEW, LEAD_MATCH_GAP_GAIN, LEAD_MATCH_SPEED_HEADROOM,
+  LEAD_SWITCH_MAX_HOLD_TIME,
   MATCHED_SPEED_DECEL_RATE, MPC_DECEL_JERK_COST_MULTIPLIER, MPC_DECEL_JERK_MAX_REQUIRED_DECEL, MPC_DECEL_JERK_MAX_REQUIRED_DECEL_RATE,
   MPC_DECEL_JERK_MAX_TARGET_REDUCTION, MPC_DECEL_TREND_FRAMES, SPEED_RELIEF_DEADBAND, SPEED_RESTRICT_DEADBAND, TARGET_SPEED_ARM_MARGIN,
-  TARGET_SPEED_RESERVE, PLANNER_BRAKING_ACCEL_THRESHOLD, RADAR_STALE_TIMEOUT, STOP_HOLD_CREEP_DISTANCE, STOP_HOLD_EGO_SPEED,
+  TARGET_RELEASE_SLEW, TARGET_SPEED_RESERVE, PLANNER_BRAKING_ACCEL_THRESHOLD, RADAR_STALE_TIMEOUT, STOP_HOLD_CREEP_DISTANCE, STOP_HOLD_EGO_SPEED,
   STOP_HOLD_EXIT_FRAMES, STOP_HOLD_EXIT_SPEED, STOP_HOLD_MAX_LEAD_DISTANCE, VEGO_NOISE_TOLERANCE, PARAM_READ_INTERVAL, AccelProfile,
   profile_accel_max, sanitize_profile,
 )
@@ -29,6 +30,7 @@ class AccelController:
     self.dt = dt
     self.delay = float(CP.longitudinalActuatorDelay) + DT_MDL
     self.lead_loss_hold_frames = max(CAP_FILTER_FRAMES, math.ceil(LEAD_LOSS_HOLD_TIME / dt))
+    self.lead_switch_max_hold_frames = max(self.lead_loss_hold_frames, math.ceil(LEAD_SWITCH_MAX_HOLD_TIME / dt))
     self.radar_stale_frames = max(1, math.ceil(RADAR_STALE_TIMEOUT / dt))
     self.params = Params()
     self.available = bool(CP.openpilotLongitudinalControl)
@@ -88,10 +90,8 @@ class AccelController:
                           and (guarded_restriction or planner_accel <= PLANNER_BRAKING_ACCEL_THRESHOLD))
     confirmed_relief = (not has_lead or (state.target_speed is not None and lead_plan.closing_speed <= 0.0
                         and lead_plan.cap >= state.target_speed + SPEED_RELIEF_DEADBAND))
-    if switched_to_relief and state.lead_switch_guard_frames == 0:
-      state.lead_switch_guard_frames = self.lead_loss_hold_frames
-    elif state.lead_switch_guard_frames > 0:
-      state.lead_switch_guard_frames = (state.lead_switch_guard_frames - 1 if confirmed_relief else self.lead_loss_hold_frames)
+    state.update_lead_switch_guard(switched_to_relief, confirmed_relief, slot_changed or track_changed or false_relief,
+                                   self.lead_loss_hold_frames, self.lead_switch_max_hold_frames)
     if slot_changed or track_changed:
       state.matched_lead = False
       state.matched_accel_limit = None
@@ -99,7 +99,7 @@ class AccelController:
       state.selected_lead = lead_plan.selected_lead
       state.selected_lead_track_id = lead_plan.selected_lead_track_id
     elif state.lead_loss_frames >= self.lead_loss_hold_frames:
-      state.lead_switch_guard_frames = 0
+      state.reset_lead_switch_guard()
       state.selected_lead = state.selected_lead_track_id = -1
     departure_separation = (lead_plan.departure_lead_separations[lead_plan.departure_lead_index]
                             if lead_plan.departure_lead_index >= 0 else math.inf)
@@ -120,6 +120,8 @@ class AccelController:
       e2e_handoff = previous_mpc_source == LongitudinalPlanSource.e2e
       seed_from_ego = has_lead and planner_accel > PLANNER_BRAKING_ACCEL_THRESHOLD and not e2e_handoff
       state.target_speed = min(base_speed, v_ego) if seed_from_ego else base_speed
+      if seed_from_ego and v_ego >= LAUNCH_END_SPEED and lead_plan.closing_speed > 0.0:
+        state.arm_release_slew()
       state.e2e_braking_handoff = e2e_handoff and planner_accel < 0.0
       state.state = AccelControllerState.free
       if v_ego < STOP_HOLD_EGO_SPEED and not stop_evidence:
@@ -197,6 +199,7 @@ class AccelController:
     if not has_lead and (state.matched_lead or lost_lead_source):
       if lost_lead_source:
         state.target_speed = max(planner_speed, state.target_speed - MATCHED_SPEED_DECEL_RATE * self.dt)
+        state.arm_release_slew()
       state.state = AccelControllerState.hold
       return state.target_speed
 
@@ -219,12 +222,18 @@ class AccelController:
       matched_ceiling = min(base_speed, filtered_cap)
       if matched_ceiling <= state.target_speed - SPEED_RESTRICT_DEADBAND:
         state.target_speed = max(matched_ceiling, state.target_speed - MATCHED_SPEED_DECEL_RATE * self.dt)
+        state.arm_release_slew()
         state.state = AccelControllerState.restrict
-      elif state.lead_switch_guard_frames == 0 and matched_ceiling >= state.target_speed + SPEED_RELIEF_DEADBAND:
+      elif (state.lead_switch_guard_frames == 0 and matched_ceiling >= state.target_speed + SPEED_RELIEF_DEADBAND
+            and (state.lead_switch_elapsed_frames < self.lead_switch_max_hold_frames or planner_accel > PLANNER_BRAKING_ACCEL_THRESHOLD)):
         state.target_speed = min(matched_ceiling, state.target_speed + profile_max_accel * self.dt)
         state.state = AccelControllerState.free if state.target_speed >= base_speed - SPEED_RESTRICT_DEADBAND else AccelControllerState.release
       else:
         state.state = AccelControllerState.free if state.target_speed >= base_speed - SPEED_RESTRICT_DEADBAND else AccelControllerState.hold
+      if state.state == AccelControllerState.free:
+        state.reset_release_slew(state.target_speed)
+      else:
+        state.update_release_slew(matched_ceiling, math.isfinite(matched_ceiling) and state.target_speed == matched_ceiling)
       return state.target_speed
     state.matched_accel_limit = None
 
@@ -234,6 +243,7 @@ class AccelController:
 
     if ceiling <= state.target_speed - SPEED_RESTRICT_DEADBAND or (state.state == AccelControllerState.restrict and ceiling < state.target_speed):
       state.target_speed = max(ceiling, state.target_speed - comfort_decel * self.dt)
+      state.arm_release_slew()
       state.state = AccelControllerState.restrict
       return state.target_speed
 
@@ -244,14 +254,27 @@ class AccelController:
       return state.target_speed
 
     confirmed_clear_road = not math.isfinite(filtered_cap) and not guarded_lead_loss
-    relief = not has_lead or lead_plan.closing_speed <= 0.0
-    if relief and (ceiling >= state.target_speed + SPEED_RELIEF_DEADBAND or (confirmed_clear_road and ceiling > state.target_speed)):
+    relief = (not has_lead or lead_plan.closing_speed <= 0.0) and planner_accel > PLANNER_BRAKING_ACCEL_THRESHOLD
+    continuing_release = state.release_slew_armed and ceiling > state.target_speed
+    if relief and (continuing_release or ceiling >= state.target_speed + SPEED_RELIEF_DEADBAND
+                   or (confirmed_clear_road and ceiling > state.target_speed)):
       if state.lead_switch_guard_frames == 0:
-        state.target_speed = ceiling
-      state.state = (AccelControllerState.hold if state.lead_switch_guard_frames > 0 else
-                     AccelControllerState.free if state.target_speed >= base_speed - SPEED_RESTRICT_DEADBAND else AccelControllerState.release)
+        timed_out = state.lead_switch_elapsed_frames >= self.lead_switch_max_hold_frames
+        if not state.release_slew_armed and (timed_out or (state.release_settle_speed is not None
+                                                          and ceiling - state.target_speed > TARGET_RELEASE_SLEW * self.dt)):
+          state.arm_release_slew(force=True)
+        release_rate = comfort_decel if timed_out else TARGET_RELEASE_SLEW
+        state.target_speed = min(ceiling, state.target_speed + release_rate * self.dt) if state.release_slew_armed else ceiling
+      if state.release_slew_armed and state.target_speed < ceiling:
+        state.state = AccelControllerState.release
+      else:
+        state.state = AccelControllerState.free if state.target_speed >= base_speed - SPEED_RESTRICT_DEADBAND else AccelControllerState.hold
     else:
       state.state = AccelControllerState.free if state.target_speed >= base_speed - SPEED_RESTRICT_DEADBAND else AccelControllerState.hold
+    if state.target_speed >= base_speed:
+      state.reset_release_slew(state.target_speed)
+    else:
+      state.update_release_slew(ceiling, math.isfinite(ceiling) and state.target_speed == ceiling)
     return state.target_speed
 
   def _update_freshness(self, radar_fresh: bool) -> None:
